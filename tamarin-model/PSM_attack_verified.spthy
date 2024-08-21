@@ -1,0 +1,346 @@
+/*
+ *  Author: 
+ *  Model Name: attack_PSM.spthy
+ *  Status: DEVELOPMENTAL
+ *
+ *  Comments: This file is for the attack version of PSM, 
+ *  rewrite the attack_PSM to achieve better MAC spoofing method
+ */
+
+theory attack_PSM
+begin
+
+builtins: symmetric-encryption, multiset
+functions: senc/2, sdec/2, MIC/1
+equations: sdec(senc(message,key),key) = message
+
+// BEGIN Restrictions  
+
+// restriction Neq:
+//     "All x y #i. Neq(x, y) @ i ==> not(x = y)"
+
+restriction Equality:
+    "All x y #i. Eq(x,y) @ i ==> x = y"
+
+restriction Neq:
+    "All x y #i. Neq(x, y) @ i ==> not(x = y)"
+
+
+
+// BEGIN rules -------------------------------------------
+
+// This rule is for initialting the client address and AP SSID
+// and means that the 
+rule Init:
+    [ Fr(~staAddress), Fr(~apSSID) ]
+  --[ ]->
+    [ StaMACAddress(~staAddress)
+    , ApSSID(~apSSID) ]
+
+
+// This is for MACspoofing
+// if the attacker know the legitmate sta addrss, it will act as sta
+// and associate with AP
+rule AttackerAssociate:
+    [ StaMACAddress(staAddress)
+    , ApSSID(apSSID) ]
+  --[ AttackerAssociate(apSSID,staAddress) ]->
+    [ AttackerAssociated(apSSID,staAddress) ]
+
+
+// This is for MACspoofing
+// This is the key exchange between Attacker and AP
+// And build the SA 
+rule AttackerExchangeKey:
+    [ AttackerAssociated(apSSID,staAddress)
+    , Fr(~key) ]
+  --[ AttackerAuthenticated(apSSID,staAddress)
+    , AttackerKeyExchange(apSSID,staAddress,~key) ]->
+    [ AttackerAwakeState(staAddress,~key)
+    , APState(apSSID,~key)
+    , AttackerWillDoze(staAddress,~key)
+    , APSecurityAssociation(apSSID,staAddress,~key) ]
+
+
+// the attacker will send DozeMsg to AP as staAddress
+// the packet should be <<PwrMgmt,staAddress>, encryptedMsg, encrptedMIC>
+// The STA should send a meesage indicating PwrMgmt=1 to AP
+
+rule AttackerSendDozeMsg:
+  let
+    msg = 'IWantToDoze'
+    pwrMgmt = '1'
+    encyptMsg = senc(msg,key)
+    MICcode = MIC(<staAddress,msg>)
+    encryptMIC = senc(MICcode,key)
+  in
+    [ AttackerWillDoze(staAddress,key) ]
+  --[ AttackerSendDozeMsg($pwrMgmt,staAddress) ]->
+    [ AttackerSentDozeMsg(staAddress)
+    , Out(<<$pwrMgmt,staAddress>, encyptMsg, encryptMIC>)  ]
+
+
+// Then the AP receive the Doze Message
+// and save that staAddress enter sleeping mode
+rule APRecDozeMsg:
+  let
+    msg = sdec(encryptMsg,key)
+    MIC = sdec(encryptMIC,key)
+  in
+    [ In(<<pwrMgmt,staAddress>, encryptMsg, encryptMIC>)
+    , APState(apSSID,key) ]
+  --[ APRecDozeMsgAction(pwrMgmt,staAddress,msg,MIC) ]->
+    [ APRecDozeMsg(apSSID,pwrMgmt,staAddress,msg,MIC,key) ]
+
+
+// then the AP send the sleeping ack to sta
+// need to verify the pwrMgmt = 1
+rule APSendDozeACK:
+  let
+    mic = MIC(<staAddress,msg>)
+    ack = 'ack'
+    enAck = senc('ack',key)
+    originPoll = 'PSpoll'
+  in
+    [ APRecDozeMsg(apSSID,pwrMgmt,staAddress,msg,MIC,key) ]
+  --[ Eq(mic,MIC)
+    , Eq(pwrMgmt,'1')
+    , Neq(originPoll,msg)
+    , APKnowDoze(apSSID,staAddress) ]->
+    [ APStateKnowDoze(apSSID,key)
+    , APSaveDoze(apSSID,staAddress)
+    , Out(enAck) ]
+
+
+// The attacker will receive the message and enter sleeping mode
+rule AttackerEnterSleeping:
+  let
+    ack = sdec(enAck,key)
+  in
+    [ In(enAck)
+    , AttackerAwakeState(staAddress,key)
+    , AttackerSentDozeMsg(staAddress) ]
+  --[ Eq(ack,'ack')
+    , APEnerDozeState(staAddress) ]->
+    [ AttackerStateDoze(staAddress,key)
+    , AttackerDoze(staAddress) ]
+
+
+// During the Client Doze period, 
+// the STA will buffer the packet to Station
+// We first think the STA store the packet in plaintext
+rule APStoreMsg:
+    [ Fr(~msg1)
+    , Fr(~msg2)
+    , APSaveDoze(apSSID,staAddress) ]
+  --[ APWillSendMsg(apSSID,~msg1)
+  	, APWillSendMsg(apSSID,~msg2) ]->
+    [ APInQue1(apSSID,staAddress,~msg1)
+    , APInQue2(apSSID,staAddress,~msg2)
+    , APGotQueue(staAddress) ] // it means ap has message for this address
+
+
+// This is for the attacker to reassociate to AP
+// this part will make the security association to all 0 key
+rule AttackerReassociate:
+  let
+    allzerokey = '0'
+  in
+    [ AttackerStateDoze(staAddress,key)
+    , APStateKnowDoze(apSSID,key) ]
+  --[ MACSpoof(staAddress,apSSID,allzerokey) ]->
+    [ AttackerStateDozeRe(staAddress,allzerokey)
+    , APStateKnowDozeRe(apSSID,allzerokey) ]
+
+
+// This is the Attacker send the plaintext PSpoll to get queue
+// Because it's attacker, so the out is safe
+rule AttackerWake:
+  let
+    poll = 'PSpoll'
+  in
+    [ APGotQueue(staAddress)
+    , AttackerStateDozeRe(staAddress,key)
+    , AttackerDoze(staAddress)  ]
+  --[ STAAskFirstMsg(staAddress) ]->
+    [ AttackerWake(staAddress,key)
+    , OutSave(<staAddress,poll>)
+    , AttackerAskedMsg1(staAddress,key) ]
+
+
+// When AP receive the ps-poll, it will send the message
+// and the restriction is  that the message should be poll 
+rule APSendMsg1:
+  let
+    originPoll = 'PSpoll'
+
+    enMsg1 = senc(msg1,key)
+    moreData = '1'
+    newMIC = MIC(<apSSID,msg1>)
+    enNewMIC = senc(newMIC,key)
+  in
+    [ OutSave(<recStaAddress,poll>)
+    , APStateKnowDozeRe(apSSID,key)
+    , APInQue1(apSSID,staAddress,msg1)
+    , AttackerAskedMsg1(staAddress,key) ]
+  --[ APSendMsg(apSSID,msg1,key)
+  	, Eq(recStaAddress,staAddress)
+  	, Eq(poll,originPoll)
+  	, APSendMsgMoreData(apSSID,$moreData,msg1) 
+  	]->
+    [ APOutQue1(apSSID,staAddress,msg1)
+    , Out(<apSSID,$moreData,enMsg1,enNewMIC>)
+    , APSentMsg1(apSSID) ]
+
+
+
+// ---------------lemma starting --------------------
+// this lemma wants to prove that when AP send the message
+// the message will keep secret 
+// APSendMsg(apID,msg)
+
+//---------------------authentication----------------
+
+// ------------------authentication properties--------------
+// STA send doze message before conencted
+
+// authenticated after associate
+lemma AttackerAuthenticatedConnected:
+"
+    All #j apSSID staAddress.
+    AttackerAuthenticated(apSSID,staAddress) @j
+    ==>
+    (Ex #i. (AttackerAssociate(apSSID,staAddress) @i)
+      & i<j)
+"
+
+// the Attacker send doze message after authenticated
+lemma AttackerSendDozeMsgAuth:
+"
+    All #j pwrMgmt staAddress.
+    AttackerSendDozeMsg(pwrMgmt,staAddress) @j
+    ==>
+    (Ex #i apSSID. (AttackerAuthenticated(apSSID,staAddress) @i)
+      & i<j)
+"
+
+//the ap rec doz msg should after authenticted
+lemma APRecDozeMsgActionAuth:
+"
+    All #j pwrMgmt staAddress msg MIC.
+    APRecDozeMsgAction(pwrMgmt,staAddress,msg,MIC) @j
+    ==>
+    (Ex #i apSSID. (AttackerAuthenticated(apSSID,staAddress) @i)
+      & i<j)
+"
+
+// AP know doze after authentication
+lemma APKnowDozeAuth:
+"
+    All #j apSSID staAddress.
+    APKnowDoze(apSSID,staAddress) @j
+    ==>
+    (Ex #i. (AttackerAuthenticated(apSSID,staAddress) @i)
+      & i<j)
+"
+
+// sta enter doze after rec ACK
+lemma STAEnterDozeaftACK:
+"
+    All #j staAddress.
+    APEnerDozeState(staAddress) @j
+    ==>
+    (Ex #i apSSID. (APKnowDoze(apSSID,staAddress) @i)
+      & i<j)
+"
+
+// AP store message after APknow doze
+lemma APStoreaftKnowDoze:
+"
+    All #j msg apSSID.
+    APWillSendMsg(apSSID,msg) @j
+    ==>
+    (Ex #i staAddress. (APKnowDoze(apSSID,staAddress) @i)
+      & i<j)
+"
+
+// AP send message aft store
+lemma APSendMsgAftStore:
+"
+    All #j apSSID msg key.
+    APSendMsg(apSSID,msg,key) @j
+    ==>
+    (Ex #i. (APWillSendMsg(apSSID,msg)@i)
+      & i<j)
+"
+
+//-------------------integrity prroperties------------
+// the integrity of power management field
+lemma PwrMgmtInt:
+"
+  All #j pwrMgmt staAddress msg MIC.
+  APRecDozeMsgAction(pwrMgmt,staAddress,msg,MIC) @j
+  ==>
+  (Ex #i staAddress2. (AttackerSendDozeMsg(pwrMgmt,staAddress2) @i)
+    & i<j)
+"
+
+// the integrity of power management field
+lemma StaAddressInt:
+"
+  All #j pwrMgmt staAddress msg MIC.
+  APRecDozeMsgAction(pwrMgmt,staAddress,msg,MIC) @j
+  ==>
+  (Ex #i pwrMgmt2. (AttackerSendDozeMsg(pwrMgmt2,staAddress) @i)
+    & i<j)
+"
+
+//---------------------------secrecy------------
+
+lemma MsgSecrecy:
+//exists-trace
+"
+    not(
+      Ex #i #j msg apSSID key.
+      APSendMsg(apSSID,msg,key) @ #i
+      &
+      K(msg) @ #j 
+      )    
+"
+
+// the normal authenticated key secrecy
+lemma NormalKeyCon:
+"
+    not(
+      Ex #i #j apSSID staAddress key.
+      AttackerKeyExchange(apSSID,staAddress,key) @ #i 
+      &
+      K(key) @ #j
+      )
+"
+
+// the all-zero key secrecy
+lemma AllZeroKeyCon:
+"
+    not(
+      Ex #i #j apSSID staAddress key.
+      MACSpoof(staAddress,apSSID,key) @ #i
+      &
+      K(key) @ #j
+      )
+"
+
+// -------------------general--------------
+
+// this lemma means that only the STA sends the message with pwrmgmt=1
+// can the STA know doze state
+lemma ShouldSendDozeMsg:
+"
+    All #j apSSID staAddress.
+    APKnowDoze(apSSID,staAddress) @ #j
+    ==>
+    (Ex #i. AttackerSendDozeMsg('1',staAddress) @ #i
+      & i<j)
+
+"
+end

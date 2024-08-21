@@ -1,0 +1,394 @@
+/*
+ *  Author: Zilin Shen
+ *  Model Name: cache_poisoning.spthy
+ *  Status: DEVELOPMENTAL
+ *
+ *  Comments: This file is built on the fragmentation_1_0, make the fragmentation process a linear list
+ *  Problem: the process cannot terminate; solution: make the seqNum, nonce, fragNum public; encrypt the MIC
+ *  Most of this file is the same as frag_with_rekey model, but add the simplified authentication and deauthentication
+ *  Now it's neede to modify it, the aim is 
+    1. modify it to MAC spoofing 
+    2. finish the patched version
+ */
+
+theory cache_poisoning
+begin
+
+builtins: symmetric-encryption, multiset
+functions: senc/2, sdec/2, fragment/2, defragment/2, MIC/1
+equations: sdec(senc(message,key),key) = message, defragment(fragment(message,1), fragment(message,2)) = message
+
+
+// BEGIN Restrictions  
+
+// restriction Neq:
+//     "All x y #i. Neq(x, y) @ i ==> not(x = y)"
+
+restriction Equality:
+    "All x y #i. Eq(x,y) @ i ==> x = y"
+
+
+
+
+
+// Starting the rules
+// in this part, the senderID and receiverID can be seems as MAC address
+
+rule AuthMACSpoofing:
+  let
+    nonce = '1'
+    rNonce = nonce
+    seqNum = '0'
+  in
+    [ Fr(~senderID), Fr(~receiverID), Fr(~key) ]
+  --[ AttackerConnected(~senderID,~receiverID) ]->
+    [ AttackerState(~senderID,$seqNum, $nonce, ~key)
+    , ReceiverState(~receiverID, rNonce, ~key)
+    , Authenticated(~senderID,~receiverID) ]
+
+
+// fragment a message to two mesages, and then enqueue it 
+// the action: means the the sender try to send the message, and the senderEnqueue the fragments of these messages\
+// expand this Fragment to two messages fragment
+
+// this rule is for sending the first message which need fragmentation 
+// During the fragment, seqNum add 1 for each frame
+// fragNum add 1 for each fragment
+// nonce add 1 for each fragment
+// add a new state DuringFrag, means the sender sends one fragment in a frame, but not in another 
+// because after sending 1 fragment, it will deauth, senderstate will vanish
+rule Fram1frag1:
+  let
+    message11 = fragment(~message1,'1')
+    newNonce = $nonce + 1
+    fragNum = '1'
+    encryptedMsg = senc(message11, key)
+    MICcode = MIC(<$fragNum,$nonce,message11>)
+    enMICcode = senc(MICcode,key)
+  in
+    [ AttackerState(senderID,$seqNum,$nonce,key)
+    , Fr(~message1) ]
+  --[ AttackerSendFragment(senderID,message11,$fragNum,$seqNum, $nonce) ]->
+    [ Out(<$fragNum, $seqNum,$nonce, encryptedMsg, enMICcode>)
+    , DuringFrag1(senderID, $seqNum, $newNonce, key, ~message1)]
+
+
+// after sending first frag
+// the receiver will receive, decrypt and enqueue it
+rule RecFrag1:
+  let
+    plainMsg = sdec(encryptedMsg,key)
+    MICcode = sdec(enMICcode,key)
+    mic = MIC(<fragNum,nonce,plainMsg>)
+    newRNonce = rNonce + '1'
+  in
+    [ In(<fragNum, seqNum, nonce, encryptedMsg, enMICcode>)
+    , ReceiverState(receiverID,rNonce,key)
+    , Authenticated(senderID,receiverID) ]
+  --[ Eq(mic, MICcode)
+    , Eq(nonce, rNonce)
+    , ReceiverRecFrag(receiverID, plainMsg, fragNum, seqNum, nonce) ]->
+    [ OutRQue(receiverID, plainMsg, fragNum, seqNum, nonce)
+    , Deauthenticated(senderID,receiverID) ]
+
+
+// after the deauthentication, the sender and receiver authenticated again
+// During the ReAuth, the Sender will connect the the Receiver, rather than the attacker
+rule ReAuth:
+  let
+    nonce = '1'
+    rNonce = nonce
+    seqNum = '0'
+  in
+    [ Deauthenticated(senderID,receiverID)
+    , Fr(~newKey) ]
+  --[ Connected(senderID,receiverID)
+    , UserAuthenticated(senderID,receiverID,~newKey) ]->
+    [ SenderStateNew(senderID, $seqNum, $nonce, ~newKey)
+    , ReceiverStateNew(receiverID, rNonce, ~newKey) ]
+
+
+// // this rule is for sending the second message which need fragmentation
+// // rule Fragment2:
+// // starts the processing of fragmentation frame 2
+rule Fram2frag1:
+  let
+    message21 = fragment(~message2,'1')
+    newNonce = $nonce+'1'
+    fragNum = '1'
+    encryptedMsg = senc(message21,key)
+    MICcode = MIC(<$fragNum,$nonce,message21>)
+    enMICcode = senc(MICcode,key)
+  in
+    [ SenderStateNew(senderID,$seqNum,$nonce,key)
+    , Fr(~message2) ]
+  --[ SenderSendFragment(senderID,message21,$fragNum,$seqNum, $nonce)
+    , SenderSendFragmentCom(senderID,message21,$seqNum,~message2) ]->
+    [ Out(<$fragNum, $seqNum,$nonce, encryptedMsg, enMICcode>)
+    , SenderState3(senderID,$seqNum,$newNonce,key)
+    , DuringFrag2(senderID, $seqNum,$newNonce,key,~message2) ]
+
+
+rule Fram2frag2:
+  let
+    message22 = fragment(message2,'2')
+    newNonce = $nonce+'1'
+    newSeqNum = $seqNum+'1'
+    fragNum = '2'
+    encryptedMsg = senc(message22,key)
+    MICcode = MIC(<$fragNum,$nonce,message22>)
+    enMICcode = senc(MICcode,key)
+  in
+    [ SenderState3(senderID,$seqNum,$nonce,key)
+    , DuringFrag2(senderID,$seqNum,$nonce,key, message2) ]
+  --[ SenderSendFragment(senderID,message22,$fragNum,$seqNum, $nonce)
+    , SenderSend(senderID,message2,$seqNum)
+    , SenderSendFragmentCom(senderID,message22,$seqNum,message2) ]->
+    [ Out(<$fragNum, $seqNum,$nonce, encryptedMsg, enMICcode>)
+    , SenderState4(senderID,$newSeqNum,$newNonce,key)
+    , Fram2Fini(senderID) ]
+
+
+rule RecFrag3:
+  let
+    plainMsg = sdec(encryptedMsg,key)
+    MICcode = sdec(enMICcode,key)
+    mic = MIC(<fragNum,nonce,plainMsg>)
+    newRNonce = rNonce + '1'
+  in
+    [ In(<fragNum, seqNum, nonce, encryptedMsg, enMICcode>)
+    , ReceiverStateNew(receiverID,rNonce,key) ]
+  --[ Eq(mic, MICcode)
+    , Eq(nonce, rNonce)
+    , ReceiverRecFrag(receiverID, plainMsg, fragNum, seqNum, nonce) ]->
+    [ OutRQue(receiverID, plainMsg, fragNum, seqNum, nonce)
+    , ReceiverState4(receiverID,newRNonce,key) ]
+
+rule RecFrag4:
+  let
+    plainMsg = sdec(encryptedMsg,key)
+    MICcode = sdec(enMICcode,key)
+    mic = MIC(<fragNum,nonce,plainMsg>)
+    newRNonce = rNonce + '1'
+  in
+    [ In(<fragNum, seqNum, nonce, encryptedMsg, enMICcode>)
+    , ReceiverState4(receiverID,rNonce,key) ]
+  --[ Eq(mic, MICcode)
+    , Eq(nonce, rNonce)
+    , ReceiverRecFrag(receiverID, plainMsg, fragNum, seqNum, nonce) ]->
+    [ OutRQue(receiverID, plainMsg, fragNum, seqNum, nonce)
+    , ReceiverState5(receiverID,newRNonce,key) ]
+
+
+// this rule defragment two plain fragments to one fragment
+// we should ensure that frag numbers are 1 and 2
+// and nonce1 +1 = nonce2
+rule DeFragment:
+  let
+    recMsg = defragment(plainMsg1,plainMsg2)
+  in
+    [ OutRQue(receiverID, plainMsg1, '1', seqNum, nonce1)
+    , OutRQue(receiverID, plainMsg2, '2', seqNum, nonce2) ]
+  --[ ReceiverReceive(receiverID, recMsg,seqNum) ]->
+    [ ReceiverRec(receiverID, recMsg)]
+
+
+
+//START the lemmas ---------------------------------------------------------------------------
+
+// --------------------authentication properties-----------------
+// send should after the user connected
+lemma SenderSendFragmentConnected:
+"
+    All #j senderID message fragNum seqNum nonce.
+    SenderSendFragment(senderID,message,fragNum,seqNum,nonce) @j
+    ==> 
+    (Ex #i receiverID. (Connected(senderID,receiverID) @i)
+      & i<j)
+"
+
+// receive should after the user connected
+lemma ReceiverRecFragConnected:
+"
+    All #j receiverID plainMsg fragNum seqNum nonce.
+    ReceiverRecFrag(receiverID, plainMsg, fragNum, seqNum, nonce) @j
+    ==>
+    (Ex #i senderID. (Connected(senderID,receiverID) @i)
+      & i<j)
+"
+
+// the sender should after user connected or attacker connected
+lemma SenderSendFragmentConnectedAttacker:
+"
+    All #j senderID message fragNum seqNum nonce.
+    SenderSendFragment(senderID,message,fragNum,seqNum,nonce) @j
+    ==> 
+    (Ex #i receiverID. (Connected(senderID,receiverID) @i)
+      & i<j)
+    |
+    (Ex #k receiverID2. (AttackerConnected(senderID,receiverID2) @k )
+      & k<j)
+"
+
+// the receive should after user connected of attacker conneted
+lemma ReceiverRecFragConnectedAttacker:
+"
+    All #j receiverID plainMsg fragNum seqNum nonce.
+    ReceiverRecFrag(receiverID, plainMsg, fragNum, seqNum, nonce) @j
+    ==>
+    (Ex #i senderID. (Connected(senderID,receiverID) @i)
+      & i<j)
+    |
+    (Ex #k senderID2. (AttackerConnected(senderID2,receiverID) @k)
+      & k<j) 
+"
+
+// The sender send should after connected
+lemma SenderSendConnected:
+"
+    All #j senderID message seqNum.
+    SenderSend(senderID,message,seqNum) @j
+    ==>
+    (Ex #i receiverID. (Connected(senderID,receiverID) @i)
+      & i<j)
+"
+
+// the receiver receive should after connected
+lemma ReceiverReceiveConnected:
+"
+    All #j receiverID msg seqNum.
+    ReceiverReceive(receiverID, msg, seqNum) @j
+    ==>
+    (Ex #i senderID. (Connected(senderID,receiverID) @i)
+      & i<j)
+"
+
+//----------------------integrity divider-------------------
+// this lemma shows that if the receiver receive a fragment
+// the sender should send the fragment before
+// to make sure that the msg, numbers and nonce don't change
+lemma SentREnque:
+"
+    All #j msg fragNum seqNum nonce receiverID.
+    ReceiverRecFrag(receiverID,msg,fragNum,seqNum,nonce) @j
+    ==> 
+    (Ex #i senderID. (SenderSendFragment(senderID,msg,fragNum,seqNum, nonce) @i) & i<j)
+" 
+
+lemma SentREnqueWOseq:
+"
+    All #j msg fragNum seqNum nonce receiverID.
+    ReceiverRecFrag(receiverID,msg,fragNum,seqNum,nonce) @j
+    ==> 
+    (Ex #i senderID seqNum2. (SenderSendFragment(senderID,msg,fragNum,seqNum2, nonce) @i) & i<j)
+" 
+
+// Starting the lemmas
+// Message Integriity2: if receiver receives s.th. it should be sent by receiver before
+lemma MessageIntegrity:
+"
+    All m #j receiverID seqNum.
+    ReceiverReceive(receiverID, m, seqNum) @j
+    ==> (Ex #i senderID seqNum2. (SenderSend(senderID, m,seqNum2) @i ) & i<j )
+"
+
+// the integrity of whole frame seqNum
+lemma WholeSeqNumIntegrity:
+"
+    All m #j receiverID seqNum.
+    ReceiverReceive(receiverID, m, seqNum) @j
+    ==> (Ex #i senderID. (SenderSend(senderID, m,seqNum) @i ) & i<j )
+"
+
+
+// this lemma is for integrity of fragment
+lemma IntFragment:
+"
+    All #j msg fragNum seqNum nonce receiverID.
+    ReceiverRecFrag(receiverID,msg,fragNum,seqNum,nonce) @j
+    ==>
+    (Ex #i senderID fragNum2 seqNum2 nonce2. (SenderSendFragment(senderID,msg,fragNum2,seqNum2,nonce2) @i) & i<j)
+"
+
+lemma IntFragNum:
+"
+   All #j msg fragNum seqNum nonce receiverID.
+   ReceiverRecFrag(receiverID,msg,fragNum,seqNum,nonce) @j
+   ==>
+   (Ex #i senderID seqNum2 nonce2. (SenderSendFragment(senderID,msg,fragNum,seqNum2,nonce2) @i) & i<j)
+ 
+"
+
+lemma IntSeqNum:
+"
+   All #j msg fragNum seqNum nonce receiverID.
+   ReceiverRecFrag(receiverID,msg,fragNum,seqNum,nonce) @j
+   ==>
+   (Ex #i senderID fragNum2 nonce2. (SenderSendFragment(senderID,msg,fragNum2,seqNum,nonce2) @i) & i<j)
+ 
+"
+
+lemma IntNonce:
+"
+   All #j msg fragNum seqNum nonce receiverID.
+   ReceiverRecFrag(receiverID,msg,fragNum,seqNum,nonce) @j
+   ==>
+   (Ex #i senderID seqNum2 fragNum2. (SenderSendFragment(senderID,msg,fragNum2,seqNum2,nonce) @i) & i<j)
+ 
+"
+
+//-------------------------secrecy properties-------------
+
+// the confidentiality / secrecy of the sent fragment
+// doesn't exist, sendersendfragment a msg, and the attacker knows the msg
+lemma ConMsg:
+"
+  not(
+    Ex #i #j msg fragNum seqNum nonce senderID.
+    SenderSendFragment(senderID,msg,fragNum,seqNum,nonce) @ #i
+    & K(msg) @ #j
+    )
+"
+
+// there is now one know the key
+lemma ConKey:
+"
+  not(
+    Ex #i #j senderID receiverID key.
+    UserAuthenticated(senderID,receiverID,key) @ #i
+    & K(key) @ #j
+    )
+"
+
+// there is no one know the whole frame
+lemma ConFrame:
+"
+  not(
+    Ex #i #j senderID m seqNum.
+    SenderSend(senderID, m,seqNum) @ #i
+    & K(m) @ #j
+    )
+"
+
+// the secrecy of seqNum
+lemma ConSeqNum:
+"
+    not(
+    Ex #i #j senderID m seqNum.
+    SenderSend(senderID, m,seqNum) @ #i
+    & K(seqNum) @ #j
+    )
+"
+
+//--------------------start general properties----------
+lemma SeqNumSameSending:
+"
+    All #i #j senderID msg1 msg2 seqNum2 seqNum1 msg.
+    SenderSendFragmentCom(senderID,msg1,seqNum1,msg) @i
+    &
+    SenderSendFragmentCom(senderID,msg2,seqNum2,msg) @j 
+    ==>
+    (seqNum1=seqNum2)
+"
+
+end
